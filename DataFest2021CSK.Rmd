@@ -1,0 +1,318 @@
+---
+title: Predicting Drug Misuse with Logistic Model on Binary Indicator Variables based
+  on BIC Score
+author: "Clayton Covington, Sameer Rao, Kyle Sorensen"
+date: "4/9/2021"
+output:
+  pdf_document: default
+  html_document: default
+subtitle: From Rocky Mountain Poison & Drug Safety
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+usa = read.csv("us_18Q1.csv")
+library(leaps)
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(janitor)
+library(caret)
+```
+
+# Part 1: Attempt at Reducing Dimensionality
+
+In an effort to reduce the dimensionality of our dataset since it is quite large, we attempted to perform a principal component analysis of the 2018 USA dataset. To do this, we first filtered the dataset for `NA` values and kept numeric data only. This step was primarily exploratory. The output below is a scree plot showing the proportion of variance that can be accounted for with a given number of principal components. This plot does not show any desired "bend," so we move on to other methods.
+
+```{r echo=FALSE}
+na_filtered <- usa[,apply(usa, 2, function(x) !any(is.na(x)))]
+
+na_filtered_numeric <- na_filtered %>%
+  select(-c(DATE, START_DATE, QTIME, DEM_STATE, WT))
+
+na_non_constant <- remove_constant(na_filtered_numeric)
+
+pca <- prcomp(na_non_constant, center = T, scale = T)
+pca_matrix <- round(as.matrix(pca$x), 5)
+screeplot(pca, type = "lines", main = "Scree Plot for USA Dataset")
+```
+
+Next, we observed change in the cumulative proportion of variance explained by each principal component in order to support our findings in the scree plot. This further suggests that a PCA is not appropriate for this dataset.
+
+```{r echo=FALSE}
+sum(round(as.matrix(pca$sdev), 5)[1:10,])/sum(round(as.matrix(pca$sdev), 5))
+sum(round(as.matrix(pca$sdev), 5))
+
+pca_plot_x <- seq(1:144)
+
+pca_plot_cumul <- as.numeric(c())
+sum <- 0
+i <- 1
+
+for (point in pca$sdev) {
+  sum <- sum + point
+  pca_plot_cumul[i] = sum
+  i = i + 1
+}
+
+plot(pca_plot_x, pca_plot_cumul / sum(as.matrix(pca$sdev)), main = "Cumulative Proportion of Variance Explained by Each PC", xlab = "Principal Component", ylab = "Proportion")
+```
+
+# Part 2: Identifying Binary Variables
+
+After some exploratory data analysis with PCA, we started with a function called `all_probs()` which takes in one of the data sets provided by Rocky Mountain Poison & Drug Safety, as well as a minimum `drug_misuse_rating`. The output of this function is a list of all binary indicator variables, which we have decided to use as our primary predictors. In addition, the output gives details on which binary variables lead to increased and decreased risks.
+
+```{r echo=FALSE}
+all_probs = function(sample_data, drug_misuse_rating){
+  
+  # Places to store Data
+  
+  # These three are to help us understand our columns,
+  not_numeric = c()
+  not_binary = c()
+  too_little_data = c() # When n < 50
+  clear_vector = c()
+  
+  
+  classify = c() #Greater than 50% chance if respondant answers yes
+  increased_risk = c() # Elevated chance if respondant answers yes
+  decreased_risk = c() # Lowered chance if respondant answers yes
+  
+  Risk_Data = data.frame(Variable = "Placeholder", Total = 0, Increase = 0) # Data frame to save our results!
+  
+  
+  # Iterators for the above ^
+  o = 1 # not_numeric
+  p = 1 # not_binary
+  q = 1 # increased_risk
+  r = 1 # classify
+  s = 1 # too_little_data 
+  t = 1 # Risk_Data
+  u = 1 # decreased_risk (added later)
+  
+  # Create drug_misuse binary for comparisons
+
+  # drug_misuse_rating is just how strict a standard we wish to use, 0 is lowest, 9 is highest
+  sample_data$drug_misuse = ifelse(sample_data$DAST_SUM > drug_misuse_rating, 1, 0)
+  
+  
+  # Clears binaries that are used to calculate drug_misuse
+  for (v in 1:10){
+    clear_vector[v] = rbind(paste("DAST_", v, sep = ""))}
+    sample_data = select(sample_data, -c(clear_vector))
+  
+  # ...Here we go...all columns
+  for (i in 1:ncol(sample_data)){
+    if (colnames(sample_data)[i] == "DEM_GENDER"){ # Special case, makes that one actually binary
+      sample_data$DEM_GENDER = as.integer((sample_data$DEM_GENDER - 1))
+    } 
+    
+    
+    if (is.integer(sample_data[,i])){ # Checks that column is integer
+
+      if (length(unique(sample_data[,i])) == 2){ # Checks that column is binary
+        
+        temp_data = sample_data[,c(i,ncol(sample_data))]
+        
+        yes_bool = filter(temp_data, temp_data[,1] == 1) # Cases where binary is true
+        
+        if (nrow(yes_bool) < 50){ # First check for too little data
+          too_little_data[s] = colnames(sample_data)[i]
+          s = s + 1
+        }
+        
+        
+        else{
+          
+        yes_bool = na.omit(yes_bool)
+        yes_count = count(yes_bool, drug_misuse)
+        yes_count$percent = yes_count$n / sum(yes_count$n)
+        
+        no_bool = filter(temp_data, temp_data[,1] == 0) # Cases where binary is false
+        
+        if (nrow(no_bool) < 50){ # Second check for too little data
+          too_little_data[s] = colnames(sample_data)[i]
+          s = s + 1
+        }
+        else {
+        
+        # Debugging
+        if(is.na(yes_count$percent[2])) {
+        yes_count$percent[2] = 0}
+        
+        
+        # Risk assessments
+        no_bool = na.omit(no_bool)
+        no_count = count(no_bool, drug_misuse)
+        no_count$percent = no_count$n / sum(no_count$n)
+        
+        total_risk = sum(yes_count$n[2]) / sum(nrow(yes_count), nrow(no_count))
+        
+        # Save Risks to Data Frame
+        temp_data_frame = data.frame(Variable = colnames(sample_data[i]), Total = yes_count$percent[2], Increase = (yes_count$percent[2] - no_count$percent[2]))
+        Risk_Data = rbind(Risk_Data, temp_data_frame)
+        t = t + 1
+        
+        
+        # Add column to list if it is increased risk, decreased risk,  and/or more than 50%
+        if (yes_count$percent[2] > no_count$percent[2]){
+          increased_risk[q] = colnames(sample_data)[i]
+          q = q + 1 
+        }
+        
+        if (yes_count$percent[2] < no_count$percent[2]){
+          decreased_risk[u] = colnames(sample_data)[i]
+          u = u + 1 
+        }
+        
+        if (yes_count$percent[2] > .5){
+          classify[r] = colnames(sample_data[i])
+          r = r + 1
+        }}}
+        
+      }
+    # Records not_binary and not_numeric
+      
+    else{not_binary[p] = colnames(sample_data)[i] # Which columns aren't binary
+      p = p + 1}
+    }
+    else{
+      not_numeric[o] = colnames(sample_data)[i] # Which columns aren't integers
+      o = o + 1
+    }
+  } 
+  
+  # Creates return object
+  
+  return_var = list()
+  return_var$increased_risk = increased_risk
+  return_var$decreased_risk = decreased_risk
+  return_var$classify = classify
+  return_var$too_little_data = too_little_data
+  return_var$not_binary = not_binary
+  return_var$not_numeric = not_numeric
+  return_var$Risk_Data = Risk_Data[-1,]
+  
+  return (return_var)
+  }
+```
+
+Below, we see a use case of the `all_probs()` function, where the dataset analyzed is the 2018 USA data set and the drug misuse threshold discussed above is given by `DAST_SUM > 1`.
+
+The command `results$increased_risk` reveals all binary variables such that a response coded to 1 in the dataset leads to a proportional increase in risk of drug misuse.
+
+```{r echo=FALSE}
+results = all_probs(usa, 1) # Number indicates how severe the drug misuse is.
+
+DATA = results$Risk_Data
+
+DATA$Total = results$Risk_Data$Total * 100
+DATA$Increase = results$Risk_Data$Increase * 100
+
+results$increased_risk
+```
+
+The `all_probs()` function identified increased risks for 79 of the variables in the 2018 USA dataset. These increased risks are largely for the questions asking about drug use, but a few are not. In particular, if a respondent was a student, a veteran, or worked in the health profession, they have a higher risk of drug misuse.
+
+The command `results$decreased_risk` reveals all binary variables such that a response coded to 1 in the dataset leads to a proportional increase in risk of drug misuse.
+
+```{r echo=FALSE}
+results$decreased_risk
+```
+
+The `all_probs()` function identified decreased risks for 3 of the variables in the 2018 USA data. This includes gender, suggesting that, overall, women have a lower risk for drug misuse than men.
+
+The command `results$classify` reveals all binary variables such that a response coded to 1 in the dataset leads to an increase of 50 percent or greater in achieving our threshold for risk of drug misuse. In the case with a threshold of 1, there are 27 of this class of variable.
+
+```{r echo=FALSE}
+results$classify
+```
+
+The command `results$Risk_Data` outputs a dataframe that contains the increase in proportion discussed above, as well as the total when that variable is under consideration.
+
+```{r echo=FALSE}
+DATA = results$Risk_Data
+head(DATA)
+```
+
+# Part 3: Logistic Regression on the Binary Variables
+
+After acquiring data on the binary variables, we made an attempt to predict drug misuse based on some subset of these variables. For this we used a logistic regression because we are trying to predict a binary variable. We could have used linear discriminant analysis, but LDA requires more assumptions about the underlying predictor variables, assumptions that we suspected were not met.
+
+To achieve this, we use the `regsubsets()` function in the `leaps` package, which tells use the "best" model for each dataset based on some performance metric such AIC or BIC. In our situation, we use BIC, since we would like to "reward" a simpler model. We start by looking at the binary variables in order of greatest influence on risk of drug misuse. In this case, our ideal number of parameters is given by the one with minimum BIC at drug misuse threshold greater than 1, indicating any drug misuse. Based on this graph, we determined that the optimal number of parameters is 7.
+
+```{r echo=FALSE}
+regsub_data = DATA[order(-abs(DATA$Increase)),][1:12,]
+
+
+usa$drug_misuse = ifelse(usa$DAST_SUM > 1, 1, 0)
+regsub_comp = select(usa, c(unique(regsub_data$Variable), "drug_misuse"))
+reg_sub = regsubsets(drug_misuse~., data = regsub_comp, y = regsub_comp$drug_misuse, nvmax = 12)
+regsub_summary = summary(reg_sub)
+regsub_summary
+
+BIC = nrow(usa) * log(regsub_summary$rss / nrow(usa)) + (1:12) * log(nrow(usa))
+
+
+plot(1:12, BIC, main = "BIC Score for Ideal Model at Each Size", xlab = "Number of Parameters")
+```
+
+From the `regsubsets()` function, we note that the best 7 binary parameters to include are given by "DRSHOP_SELL", "DRSHOP_USE", "HELP_SUB_USE", "BENZ_NMU_WK", "STIM_NMU_WK", "STIM_NMU_YR" and "MORPH_NMU_NTY" with a BIC score of -70053.50. Here, we create logistic model based on these binary variables. We also display a summary of the logistic model and note that all parameters are highly significant and that the AIC score (15049) is quite low along with the BIC score given above, indicating a properly fitted logistic model. (<strong>WARNING: this logistic regression is on the entire data set for identifying the predictors properly.</strong>)
+
+```{r echo=FALSE}
+
+ideal_vector = c("DRSHOP_SELL", "DRSHOP_USE", "HELP_SUB_USE", "BENZ_NMU_WK", "STIM_NMU_WK", "STIM_NMU_YR", "MORPH_NMU_NTY",  "drug_misuse")
+ideal_data = select(usa, ideal_vector)
+
+ideal_logistic = glm(drug_misuse~., data = ideal_data)
+log_summary = summary(ideal_logistic)
+log_summary
+```
+
+# Part 4: Diagnostics on Logistic Regression
+
+Finally, we take a subset of 22505 observations (75 percent) from the original 2018 USA data and train our logistic model and test it against the rest of the data (7502 observations, 25 percent). Below, the output shows an estimate of the accuracy of the logistic model when tested against the testing data set. Based on this estimate, our logistic model correctly classifies an estimated 88.75% of all survey takers. 
+
+```{r echo=FALSE}
+set.seed(124123)
+training_size = round(.75 * nrow(usa))
+training_indexes = sample(nrow(usa), training_size)
+training_set = usa[training_indexes,]
+testing_set = usa[-training_indexes,]
+
+training_data = select(training_set, ideal_vector)
+training_logist = glm(drug_misuse~., data = training_data)
+testing_data = select(testing_set, ideal_vector)
+predictions_train = ifelse(predict.glm(training_logist, training_data) > .5, 1, 0)
+predictions_test = ifelse(predict.glm(training_logist, testing_data) > .5, 1, 0)
+
+training_risk = sum(predictions_train == training_set$drug_misuse) / nrow(training_set)
+testing_risk = sum(predictions_test == testing_set$drug_misuse) / nrow(testing_set)
+
+summary(training_logist)
+training_risk
+testing_risk
+```
+
+We can better understand our logistic model by looking at its confusion matrix. Based on this matrix, we are correctly identifying 97.78% of non-misusers. We are incorrectly classifying 2.21% of these non-misusers. Further, we are correctly classifying 29.22% of misusers, and incorrectly classifying 70.78%. Thus, if someone is classified as a '1' by our model, there is a 66.74% chance that they are actually a misuser. 
+
+```{r echo=FALSE}
+confusionMatrix(as.factor(predictions_test), as.factor(testing_set$drug_misuse))
+```
+
+# Part 5: Conclusions
+
+From our logistic model, we can see that the best binary predictors of drug misuse according to the provided data are (1) whether someone has attempted to get a prescription for a medication that they did not need in order to sell it and (2) in order to misuse the drug, (3) whether someone has sought professional help for substance abuse, (4) whether someone has gotten a prescription for benzodiazepine product in the last 7 days for non-medical use or (5) a prescription stimulant in the last 7 days for non-medical use or (6) a prescription stimulant in the last year days for non-medical use or (7) a prescription morphine in the last 90 days for non-medical use. Of these predictors, the ones with strongest impact on risk of drug misuse are (3), (2), and (1). Surprisingly, the indication for a stimulus prescrition for non-medical use in the last 7 days is actually negative! Perhaps this variable helps distingush between frequent users verson occasional users, or some other explanation?
+
+According to the above conclusions, the best way to predict drug misuse through a questionnaire would be with the following questions:
+
+1. Have you attempted to get a prescription for a medication that you did not need in order to sell it?
+2. Have you attempted to get a prescription for a medication that you did not need in order to misuse it?
+3. Have you ever sought professional help for substance abuse?
+4. Have you gotten a prescription for a benzodiazepine in the last 7 days for non-medical use?
+5. Have you gotten a prescription stimulant in the last 7 days for non-medical use?
+6. Have you gotten a prescription stimulant in the last year days for non-medical use?
+7. Have you gotten a prescription morphine in the last 90 days for non-medical use?
+
+While the first three questions are the strongest indicators of drug misuse based on our model, the last four questions indicate that the drugs most associated with misuse are morphine products, stimulants and benzodiazepines.
